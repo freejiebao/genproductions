@@ -36,7 +36,11 @@ make_tarball () {
 
     EXTRA_TAR_ARGS=""
     if [ -e $CARDSDIR/${name}_externaltarball.dat ]; then
-        EXTRA_TAR_ARGS="external_tarball header_for_madspin.txt"
+        EXTRA_TAR_ARGS="external_tarball header_for_madspin.txt "
+    fi
+    ### include merge.pl script for LO event merging 
+    if [ -e merge.pl ]; then
+        EXTRA_TAR_ARGS+="merge.pl "
     fi
     XZ_OPT="$XZ_OPT" tar -cJpsf ${PRODHOME}/${name}_${scram_arch}_${cmssw_version}_tarball.tar.xz mgbasedir process runcmsgrid.sh gridpack_generation*.log InputCards $EXTRA_TAR_ARGS
 
@@ -79,10 +83,12 @@ make_gridpack () {
     # CMS Connect runs git status inside its own script.
     if [ $iscmsconnect -eq 0 ]; then
       cd $PRODHOME
-      git status
-      echo "Current git revision is:"
-      git rev-parse HEAD
-      git diff | cat
+      if [ -x "$(command -v git)" ]; then
+        git status
+        echo "Current git revision is:"
+        git rev-parse HEAD
+        git diff | cat
+      fi
       cd -
     fi
     
@@ -111,6 +117,9 @@ make_gridpack () {
       ############################
       #Create a workplace to work#
       ############################
+      export VO_CMS_SW_DIR=/cvmfs/cms.cern.ch
+      source $VO_CMS_SW_DIR/cmsset_default.sh
+
       scram project -n ${name}_gridpack CMSSW ${RELEASE} ;
       if [ ! -d ${name}_gridpack ]; then  
         if [ "${BASH_SOURCE[0]}" != "${0}" ]; then echo "yes here"; return 1; else exit 1; fi
@@ -120,7 +129,12 @@ make_gridpack () {
       WORKDIR=`pwd`
       eval `scram runtime -sh`
     
-    
+      # use python 2.7 and include python bindings from default to allow "import htcondor" after cmsenv
+      set +u 
+      if [ ! -z "${PYTHON27PATH}" ] ; then export PYTHONPATH=${PYTHON27PATH} ; fi 
+      if [ ! -z "${PYTHON_BINDINGS}" ] ; then export PYTHONPATH=${PYTHONPATH}:${PYTHON_BINDINGS} ; fi
+      set -u 
+        
       #############################################
       #Copy, Unzip and Delete the MadGraph tarball#
       #############################################
@@ -390,7 +404,11 @@ make_gridpack () {
     #################################
     script_dir="${PRODHOME}/Utilities/scripts"
     if [ ! -d "$script_dir" ]; then
-      script_dir=$(git rev-parse --show-toplevel)/Utilities/scripts
+      if ! [ -x "$(command -v git)" ]; then
+        script_dir=${PRODHOME%genproductions*}/genproductions/Utilities/scripts
+      else
+        script_dir=$(git rev-parse --show-toplevel)/Utilities/scripts
+      fi
     fi
     
     prepare_run_card $name $CARDSDIR $is5FlavorScheme $script_dir $isnlo
@@ -576,7 +594,6 @@ make_gridpack () {
     #
     #Plan to decay events from external tarball?
     # 
-    
     if [ -e $CARDSDIR/${name}_externaltarball.dat ]; then
         echo "Locating the external tarball"
         cp $CARDSDIR/${name}_externaltarball.dat .
@@ -590,6 +607,11 @@ make_gridpack () {
         cd ..
         rm $tarname
     fi
+
+    # copy merge.pl from Utilities to allow merging LO events
+    cd $WORKDIR/gridpack
+    cp $PRODHOME/Utilities/merge.pl . 
+
 }
 
 #exit on first error
@@ -608,25 +630,35 @@ queue=${3}
 # processing options
 jobstep=${4}
 
-if [ -n "$5" ]
-  then
-    scram_arch=${5}
-  else
-    scram_arch=slc6_amd64_gcc630 #slc6_amd64_gcc481
-fi
-
-# Require OS and scram_arch to be consistent
+# sync default cmssw with the current OS 
 export SYSTEM_RELEASE=`cat /etc/redhat-release`
-if { [[ $SYSTEM_RELEASE == *"release 6"* ]] && [[ $scram_arch == *"slc7"* ]]; } || { [[ $SYSTEM_RELEASE == *"release 7"* ]] && [[ $scram_arch == *"slc6"* ]]; }; then
-  echo "Mismatch between architecture (${scram_arch}) and OS (${SYSTEM_RELEASE})"
-  if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 1; else exit 1; fi
+
+# set scram_arch 
+if [ -n "$5" ]; then
+    scram_arch=${5}
+else
+    if [[ $SYSTEM_RELEASE == *"release 6"* ]]; then 
+        scram_arch=slc6_amd64_gcc700 
+    elif [[ $SYSTEM_RELEASE == *"release 7"* ]]; then 
+        scram_arch=slc7_amd64_gcc700 
+    else 
+        echo "No default scram_arch for current OS!"
+        if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 1; else exit 1; fi        
+    fi
 fi
 
-if [ -n "$6" ]
-  then
+#set cmssw 
+if [ -n "$6" ]; then
     cmssw_version=${6}
-  else
-    cmssw_version=CMSSW_9_3_16 #CMSSW_7_1_30
+else
+    if [[ $SYSTEM_RELEASE == *"release 6"* ]]; then 
+        cmssw_version=CMSSW_10_2_24_patch1 
+    elif [[ $SYSTEM_RELEASE == *"release 7"* ]]; then 
+        cmssw_version=CMSSW_10_6_19 
+    else 
+        echo "No default CMSSW for current OS!"
+        if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 1; else exit 1; fi        
+    fi
 fi
  
 # jobstep can be 'ALL','CODEGEN', 'INTEGRATE', 'MADSPIN'
@@ -636,11 +668,17 @@ if [ -z "$PRODHOME" ]; then
 fi 
 
 # Folder structure is different on CMSConnect
-helpers_dir=${PRODHOME}/Utilities
-if [ ! -d "$helpers_dir" ]; then
+helpers_dir=${PRODHOME%genproductions*}/genproductions/Utilities
+helpers_file=${helpers_dir}/gridpack_helpers.sh
+if [ ! -f "$helpers_file" ]; then
+  if ! [ -x "$(command -v git)" ]; then
+    helpers_dir=${PRODHOME}/Utilities
+  else
     helpers_dir=$(git rev-parse --show-toplevel)/bin/MadGraph5_aMCatNLO/Utilities
+  fi
+  helpers_file=${helpers_dir}/gridpack_helpers.sh
 fi
-source ${helpers_dir}/gridpack_helpers.sh 
+source ${helpers_file}
 
 
 if [ ! -z ${CMSSW_BASE} ]; then
